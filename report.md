@@ -135,16 +135,7 @@ The GAN and VAE produce more diverse day values (no mode collapse), but their da
 accuracy is statistically identical (~14%), confirming that diversity does not translate to
 correctness for this condition.
 
-### 5.3 Why the Problem is Hard
-
-Computing day-of-week from a date requires multi-step modular arithmetic that spans all
-digits of the date string. For example, Zeller's congruence involves floor divisions,
-modular reductions, and century corrections. Character-level neural networks process one
-digit at a time and must implicitly learn this entire computation through gradient descent
-alone. With only 146k training samples and a 14-token vocabulary, the models lack the
-capacity and signal to learn this mapping.
-
-### 5.4 What Worked
+### 5.3 What Worked
 
 - **Token reordering** (yyyy-mm-dd): Ensured deterministic conditions (decade) are predicted
   first, yielding 100% decade accuracy.
