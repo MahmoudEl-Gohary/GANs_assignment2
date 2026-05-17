@@ -1,344 +1,487 @@
-import os
+"""Training scripts for all four date generation models.
+
+Usage:
+    python -m model.train --model lstm
+    python -m model.train --model transformer
+    python -m model.train --model gan
+    python -m model.train --model cvae
+    python -m model.train --model all
+"""
+
+import argparse
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
-from datetime import datetime
+from tqdm import tqdm
 
 from model.dataset import DatesTokenizer, DatesDataset
-from model.models import SimpleLSTMGenerator, SmallTransformerGenerator, Generator, Discriminator, ConditionalVAE
+from model.models import (
+    SimpleLSTMGenerator,
+    SmallTransformerGenerator,
+    Generator,
+    Discriminator,
+    ConditionalVAE,
+)
+from model.utils import validate_date
 
-# Custom Evaluation Metric: Calendar Validation
-def validate_date(date_str, cond_day, cond_month, cond_leap, cond_decade):
-    try:
-        # 1. Parse string to datetime
-        dt = datetime.strptime(date_str, "%d-%m-%Y")
-        
-        # 2. Check Leap Year
-        year = dt.year
-        is_leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
-        expected_leap = cond_leap == "[True]"
-        if is_leap != expected_leap:
-            return False
-            
-        # 3. Check Decade
-        expected_decade_start = int(cond_decade[1:-1]) * 10
-        if not (expected_decade_start <= year < expected_decade_start + 10):
-            return False
-            
-        # 4. Check Month
-        months_map = {'[JAN]': 1, '[FEB]': 2, '[MAR]': 3, '[APR]': 4, '[MAY]': 5, '[JUN]': 6,
-                      '[JUL]': 7, '[AUG]': 8, '[SEP]': 9, '[OCT]': 10, '[NOV]': 11, '[DEC]': 12}
-        if dt.month != months_map[cond_month]:
-            return False
-            
-        # 5. Check Day
-        days_map = {'[MON]': 0, '[TUE]': 1, '[WED]': 2, '[THU]': 3, '[FRI]': 4, '[SAT]': 5, '[SUN]': 6}
-        if dt.weekday() != days_map[cond_day]:
-            return False
-            
-        return True
-    except ValueError:
-        return False # Invalid calendar date (e.g. 30-2-2020)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+SEED = 42
+DATA_PATH = Path("data/data.txt")
+WEIGHTS_DIR = Path("model/weights")
 
-def evaluate_model(model, dataloader, tokenizer, device):
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _setup_device() -> torch.device:
+    """Select CUDA if available, else CPU."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training on device: {device}")
+    return device
+
+
+def _seed_everything(seed: int = SEED) -> None:
+    """Set manual seeds for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _get_data_splits(
+    dataset: DatesDataset,
+    batch_size: int = 64,
+) -> tuple[DataLoader, DataLoader]:
+    """Split dataset 90/10 and return train/test DataLoaders."""
+    train_size = int(0.9 * len(dataset))
+    test_size = len(dataset) - train_size
+    train_ds, test_ds = random_split(
+        dataset, [train_size, test_size],
+        generator=torch.Generator().manual_seed(SEED),
+    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    return train_loader, test_loader
+
+
+def evaluate_model(
+    model: nn.Module,
+    dataloader: DataLoader,
+    tokenizer: DatesTokenizer,
+    device: torch.device,
+) -> float:
+    """Compute calendar validation accuracy on a dataloader.
+
+    Args:
+        model: Trained model in eval mode.
+        dataloader: DataLoader yielding (conditions, targets).
+        tokenizer: DatesTokenizer for decoding.
+        device: torch device.
+
+    Returns:
+        Fraction of generated dates passing all four conditions.
+    """
     model.eval()
     correct = 0
     total = 0
-    
+
     with torch.no_grad():
         for x, _ in dataloader:
             x = x.to(device)
             batch_size = x.size(0)
-            
-            # Generate sequences
+
             predictions = model(x)
-            
+
             for i in range(batch_size):
-                # Decode conditions
                 cond_day = tokenizer.days[x[i, 0].item()]
                 cond_month = tokenizer.months[x[i, 1].item()]
                 cond_leap = tokenizer.leaps[x[i, 2].item()]
                 cond_decade = tokenizer.decades[x[i, 3].item()]
-                
-                # Decode prediction
+
                 pred_str = tokenizer.decode_output(predictions[i])
-                
+
                 if validate_date(pred_str, cond_day, cond_month, cond_leap, cond_decade):
                     correct += 1
                 total += 1
-                
-    return correct / total
 
-def train_lstm():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on device: {device}")
-    
-    # 1. Setup Data
+    return correct / total if total > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Model-specific trainers
+# ---------------------------------------------------------------------------
+
+def train_lstm(epochs: int = 30) -> None:
+    """Train the SimpleLSTMGenerator."""
+    _seed_everything()
+    device = _setup_device()
+
     tokenizer = DatesTokenizer()
-    dataset = DatesDataset("data/data.txt", tokenizer)
-    
-    # Split data (90% train, 10% test)
-    train_size = int(0.9 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
-    
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
-    
-    # 2. Setup Model - LSTM (Update hidden_dim)
-    model = SimpleLSTMGenerator(vocab_size=len(tokenizer.chars), hidden_dim=256).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.char_to_idx['<PAD>'])
-    
-    # Increase epochs
-    epochs = 15
-    
-    # 3. Training Loop
+    dataset = DatesDataset(DATA_PATH, tokenizer)
+    train_loader, test_loader = _get_data_splits(dataset)
+
+    model = SimpleLSTMGenerator(vocab_size=tokenizer.vocab_size).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True,
+    )
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_idx)
+
+    best_acc = 0.0
+
     for epoch in range(epochs):
         model.train()
-        total_loss = 0
-        
-        for x, y in train_loader:
+        total_loss = 0.0
+
+        for x, y in tqdm(train_loader, desc=f"LSTM Epoch {epoch + 1}/{epochs}", leave=False):
             x, y = x.to(device), y.to(device)
-            
+
             optimizer.zero_grad()
-            
-            # y[:, :-1] is the input to the decoder, y[:, 1:] is the target to predict
             logits = model(x, target_seq=y)
-            
-            # Flatten for CrossEntropy
-            logits = logits.view(-1, len(tokenizer.chars))
+
+            logits = logits.reshape(-1, tokenizer.vocab_size)
             targets = y[:, 1:].contiguous().view(-1)
-            
+
             loss = criterion(logits, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            
-            total_loss += loss.item()
-            
-        avg_loss = total_loss / len(train_loader)
-        
-        # 4. Evaluate using custom metric
-        val_acc = evaluate_model(model, test_loader, tokenizer, device)
-        
-        print(f"Epoch [{epoch+1}/{epochs}] | Loss: {avg_loss:.4f} | Validation Accuracy: {val_acc:.4f}")
 
-    # Save weights - LSTM
-    torch.save(model.state_dict(), "model/weights/lstm_weights.pth")
-    
-    print("Training complete. Weights saved.")
-    
-    
-def train_transformer():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on device: {device}")
-    
-    # 1. Setup Data
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(train_loader)
+        scheduler.step(avg_loss)
+
+        val_acc = evaluate_model(model, test_loader, tokenizer, device)
+
+        print(
+            f"Epoch [{epoch + 1}/{epochs}] | "
+            f"Loss: {avg_loss:.4f} | "
+            f"Val Accuracy: {val_acc:.4f} | "
+            f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+        )
+
+        # Save best weights
+        if val_acc > best_acc:
+            best_acc = val_acc
+            WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), WEIGHTS_DIR / "lstm_weights.pth")
+            print(f"  -> New best! Saved weights (acc={best_acc:.4f})")
+
+    print(f"LSTM training complete. Best accuracy: {best_acc:.4f}")
+
+
+def train_transformer(epochs: int = 30) -> None:
+    """Train the SmallTransformerGenerator."""
+    _seed_everything()
+    device = _setup_device()
+
     tokenizer = DatesTokenizer()
-    dataset = DatesDataset("data/data.txt", tokenizer)
-    
-    # Split data (90% train, 10% test)
-    train_size = int(0.9 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
-    
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
-    
-    # # 2. Setup Model - LSTM (Update hidden_dim)
-    # model = SimpleLSTMGenerator(vocab_size=len(tokenizer.chars), hidden_dim=256).to(device)
-    # optimizer = optim.Adam(model.parameters(), lr=0.001)
-    
-    # 2.  Setup Model - Transformer
-    model = SmallTransformerGenerator(vocab_size=len(tokenizer.chars)).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.char_to_idx['<PAD>'])
-    
-    # Increase epochs
-    epochs = 15
-    
-    # 3. Training Loop
+    dataset = DatesDataset(DATA_PATH, tokenizer)
+    train_loader, test_loader = _get_data_splits(dataset)
+
+    model = SmallTransformerGenerator(vocab_size=tokenizer.vocab_size).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True,
+    )
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_idx)
+
+    best_acc = 0.0
+
     for epoch in range(epochs):
         model.train()
-        total_loss = 0
-        
-        for x, y in train_loader:
+        total_loss = 0.0
+
+        for x, y in tqdm(train_loader, desc=f"Transformer Epoch {epoch + 1}/{epochs}", leave=False):
             x, y = x.to(device), y.to(device)
-            
+
             optimizer.zero_grad()
-            
-            # y[:, :-1] is the input to the decoder, y[:, 1:] is the target to predict
             logits = model(x, target_seq=y)
-            
-            # Flatten for CrossEntropy
-            logits = logits.view(-1, len(tokenizer.chars))
+
+            logits = logits.reshape(-1, tokenizer.vocab_size)
             targets = y[:, 1:].contiguous().view(-1)
-            
+
             loss = criterion(logits, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            
+
             total_loss += loss.item()
-            
+
         avg_loss = total_loss / len(train_loader)
-        
-        # 4. Evaluate using custom metric
+        scheduler.step(avg_loss)
+
         val_acc = evaluate_model(model, test_loader, tokenizer, device)
-        
-        print(f"Epoch [{epoch+1}/{epochs}] | Loss: {avg_loss:.4f} | Validation Accuracy: {val_acc:.4f}")
 
-    # Save weights - LSTM
-    # torch.save(model.state_dict(), "model/weights/lstm_weights.pth")
-    
-    # Save weights - Transformerr
-    torch.save(model.state_dict(), "model/weights/transformer_weights.pth")
-    print("Training complete. Weights saved.")
+        print(
+            f"Epoch [{epoch + 1}/{epochs}] | "
+            f"Loss: {avg_loss:.4f} | "
+            f"Val Accuracy: {val_acc:.4f} | "
+            f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+        )
 
-def train_gan():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training GAN on device: {device}")
-    
+        if val_acc > best_acc:
+            best_acc = val_acc
+            WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), WEIGHTS_DIR / "transformer_weights.pth")
+            print(f"  -> New best! Saved weights (acc={best_acc:.4f})")
+
+    print(f"Transformer training complete. Best accuracy: {best_acc:.4f}")
+
+
+def train_gan(epochs: int = 30) -> None:
+    """Train the conditional GAN (Generator + Discriminator)."""
+    _seed_everything()
+    device = _setup_device()
+
     tokenizer = DatesTokenizer()
-    dataset = DatesDataset("data/data.txt", tokenizer)
-    vocab_size = len(tokenizer.chars)
-    
-    # Smaller batches to stabilize GAN training
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-    
+    dataset = DatesDataset(DATA_PATH, tokenizer)
+    train_loader, test_loader = _get_data_splits(dataset, batch_size=64)
+
+    vocab_size = tokenizer.vocab_size
+    noise_dim = 64
+
     generator = Generator(vocab_size=vocab_size).to(device)
     discriminator = Discriminator(vocab_size=vocab_size).to(device)
-    
-    # Standard GAN optimizers
-    optimizer_G = optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
-    optimizer_D = optim.Adam(discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+
+    optimizer_G = optim.Adam(generator.parameters(), lr=2e-4, betas=(0.5, 0.999))
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=2e-4, betas=(0.5, 0.999))
     criterion = nn.BCELoss()
-    
-    epochs = 15
-    noise_dim = 64
-    
+
     for epoch in range(epochs):
         generator.train()
         discriminator.train()
-        
-        total_g_loss = 0
-        total_d_loss = 0
-        
-        for i, (x, y) in enumerate(dataloader):
+
+        total_g_loss = 0.0
+        total_d_loss = 0.0
+
+        for i, (x, y) in enumerate(tqdm(train_loader, desc=f"GAN Epoch {epoch + 1}/{epochs}", leave=False)):
             x, y = x.to(device), y.to(device)
             batch_size = x.size(0)
-            
-            # Ground truth labels
-            real_labels = torch.ones(batch_size, 1, device=device)
-            fake_labels = torch.zeros(batch_size, 1, device=device)
-            
-            # Convert real sequence to one-hot to match generator output shape
+
+            real_labels = torch.ones(batch_size, 1, device=device) * 0.9  # label smoothing
+            fake_labels = torch.zeros(batch_size, 1, device=device) + 0.1
+
             real_seq_one_hot = F.one_hot(y, num_classes=vocab_size).float()
-            
-            # ---------------------
-            #  Train Discriminator
-            # ---------------------
+
+            # --- Train Discriminator ---
             optimizer_D.zero_grad()
-            
-            # Real Loss
+
             real_preds = discriminator(x, real_seq_one_hot)
             d_loss_real = criterion(real_preds, real_labels)
-            
-            # Fake Loss
+
             noise = torch.randn(batch_size, noise_dim, device=device)
             fake_seq_probs = generator(x, noise)
             fake_preds = discriminator(x, fake_seq_probs.detach())
             d_loss_fake = criterion(fake_preds, fake_labels)
-            
-            # Update D
+
             d_loss = (d_loss_real + d_loss_fake) / 2
             d_loss.backward()
             optimizer_D.step()
-            
-            # -----------------
-            #  Train Generator
-            # -----------------
+
+            # --- Train Generator ---
             optimizer_G.zero_grad()
-            
-            # Generate fake dates and see if D thinks they are real
+
+            noise = torch.randn(batch_size, noise_dim, device=device)
+            fake_seq_probs = generator(x, noise)
             fake_preds_for_g = discriminator(x, fake_seq_probs)
-            g_loss = criterion(fake_preds_for_g, real_labels)
-            
+            g_loss = criterion(fake_preds_for_g, torch.ones(batch_size, 1, device=device))
+
             g_loss.backward()
             optimizer_G.step()
-            
+
             total_g_loss += g_loss.item()
             total_d_loss += d_loss.item()
-            
-            # Print sample to monitor visually (every 1000 batches)
-            if i % 1000 == 0:
-                with torch.no_grad():
-                    sample_probs = fake_seq_probs[0]
-                    sample_indices = sample_probs.argmax(dim=-1)
-                    decoded_str = tokenizer.decode_output(sample_indices)
-                    print(f"Batch {i} - Generated Sample: {decoded_str}")
-            
-        print(f"Epoch [{epoch+1}/{epochs}] | D Loss: {total_d_loss/len(dataloader):.4f} | G Loss: {total_g_loss/len(dataloader):.4f}")
 
-    os.makedirs("model/weights", exist_ok=True)
-    torch.save(generator.state_dict(), "model/weights/gan_generator_weights.pth")
-    torch.save(discriminator.state_dict(), "model/weights/gan_discriminator_weights.pth")
-    print("GAN Training complete. Weights saved.")
-    
-def cvae_loss_function(recon_x, x, mu, logvar, criterion):
-    # Reshape for CrossEntropy
-    recon_x_flat = recon_x.view(-1, recon_x.size(-1))
-    x_flat = x.view(-1)
-    
-    recon_loss = criterion(recon_x_flat, x_flat)
-    
-    # KL Divergence
+        avg_g = total_g_loss / len(train_loader)
+        avg_d = total_d_loss / len(train_loader)
+
+        # Evaluate GAN generator
+        generator.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for x_eval, _ in test_loader:
+                x_eval = x_eval.to(device)
+                bs = x_eval.size(0)
+                noise = torch.randn(bs, noise_dim, device=device)
+                out = generator(x_eval, noise)
+                pred_indices = out.argmax(dim=-1)
+
+                for j in range(bs):
+                    cond_day = tokenizer.days[x_eval[j, 0].item()]
+                    cond_month = tokenizer.months[x_eval[j, 1].item()]
+                    cond_leap = tokenizer.leaps[x_eval[j, 2].item()]
+                    cond_decade = tokenizer.decades[x_eval[j, 3].item()]
+
+                    pred_str = tokenizer.decode_output(pred_indices[j])
+                    if validate_date(pred_str, cond_day, cond_month, cond_leap, cond_decade):
+                        correct += 1
+                    total += 1
+
+        val_acc = correct / total if total > 0 else 0.0
+        print(
+            f"Epoch [{epoch + 1}/{epochs}] | "
+            f"D Loss: {avg_d:.4f} | G Loss: {avg_g:.4f} | "
+            f"Val Accuracy: {val_acc:.4f}"
+        )
+
+    WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    torch.save(generator.state_dict(), WEIGHTS_DIR / "gan_generator_weights.pth")
+    torch.save(discriminator.state_dict(), WEIGHTS_DIR / "gan_discriminator_weights.pth")
+    print("GAN training complete. Weights saved.")
+
+
+def _cvae_loss(
+    recon_x: torch.Tensor,
+    x: torch.Tensor,
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    criterion: nn.CrossEntropyLoss,
+    kl_weight: float = 0.01,
+) -> torch.Tensor:
+    """CVAE loss = reconstruction + KL divergence.
+
+    Args:
+        recon_x: (batch, seq_len, vocab_size) reconstructed logits.
+        x: (batch, seq_len) target indices.
+        mu: (batch, latent_dim) encoder mean.
+        logvar: (batch, latent_dim) encoder log-variance.
+        criterion: CrossEntropyLoss instance.
+        kl_weight: Weight for the KL divergence term.
+
+    Returns:
+        Scalar loss.
+    """
+    recon_loss = criterion(recon_x.view(-1, recon_x.size(-1)), x.view(-1))
+
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    kld = kld / x.size(0) 
-    
-    # KL weight is kept small to allow the model to prioritize sequence reconstruction
-    return recon_loss + (0.01 * kld)
+    kld = kld / x.size(0)
 
-def train_cvae():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training CVAE on device: {device}")
-    
+    return recon_loss + (kl_weight * kld)
+
+
+def train_cvae(epochs: int = 30) -> None:
+    """Train the Conditional VAE."""
+    _seed_everything()
+    device = _setup_device()
+
     tokenizer = DatesTokenizer()
-    dataset = DatesDataset("data/data.txt", tokenizer)
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
-    
-    model = ConditionalVAE(vocab_size=len(tokenizer.chars)).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.char_to_idx['<PAD>'])
-    
-    epochs = 15
-    
+    dataset = DatesDataset(DATA_PATH, tokenizer)
+    train_loader, test_loader = _get_data_splits(dataset)
+
+    model = ConditionalVAE(vocab_size=tokenizer.vocab_size).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True,
+    )
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_idx)
+
+    best_acc = 0.0
+
     for epoch in range(epochs):
         model.train()
-        total_loss = 0
-        
-        for x, y in dataloader:
-            x, y = x.to(device), y.to(device)
-            
-            optimizer.zero_grad()
-            
-            recon_batch, mu, logvar = model(x, y)
-            
-            loss = cvae_loss_function(recon_batch, y, mu, logvar, criterion)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            
-        avg_loss = total_loss / len(dataloader)
-        print(f"Epoch [{epoch+1}/{epochs}] | Loss: {avg_loss:.4f}")
+        total_loss = 0.0
 
-    os.makedirs("model/weights", exist_ok=True)
-    torch.save(model.state_dict(), "model/weights/cvae_weights.pth")
-    print("CVAE Training complete. Weights saved.")
+        for x, y in tqdm(train_loader, desc=f"CVAE Epoch {epoch + 1}/{epochs}", leave=False):
+            x, y = x.to(device), y.to(device)
+
+            optimizer.zero_grad()
+            recon_batch, mu, logvar = model(x, y)
+            loss = _cvae_loss(recon_batch, y, mu, logvar, criterion)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(train_loader)
+        scheduler.step(avg_loss)
+
+        # Evaluate CVAE -- use logits -> argmax at inference
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for x_eval, _ in test_loader:
+                x_eval = x_eval.to(device)
+                bs = x_eval.size(0)
+                out = model(x_eval)  # inference mode, no target
+                pred_indices = out.argmax(dim=-1)
+
+                for j in range(bs):
+                    cond_day = tokenizer.days[x_eval[j, 0].item()]
+                    cond_month = tokenizer.months[x_eval[j, 1].item()]
+                    cond_leap = tokenizer.leaps[x_eval[j, 2].item()]
+                    cond_decade = tokenizer.decades[x_eval[j, 3].item()]
+
+                    pred_str = tokenizer.decode_output(pred_indices[j])
+                    if validate_date(pred_str, cond_day, cond_month, cond_leap, cond_decade):
+                        correct += 1
+                    total += 1
+
+        val_acc = correct / total if total > 0 else 0.0
+
+        print(
+            f"Epoch [{epoch + 1}/{epochs}] | "
+            f"Loss: {avg_loss:.4f} | "
+            f"Val Accuracy: {val_acc:.4f} | "
+            f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+        )
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), WEIGHTS_DIR / "cvae_weights.pth")
+            print(f"  -> New best! Saved weights (acc={best_acc:.4f})")
+
+    print(f"CVAE training complete. Best accuracy: {best_acc:.4f}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+TRAINERS = {
+    "lstm": train_lstm,
+    "transformer": train_transformer,
+    "gan": train_gan,
+    "cvae": train_cvae,
+}
+
+
+def main() -> None:
+    """Parse CLI arguments and dispatch to the selected trainer."""
+    parser = argparse.ArgumentParser(description="Train date generation models.")
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=list(TRAINERS.keys()) + ["all"],
+        default="all",
+        help="Which model to train (default: all).",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=30,
+        help="Number of training epochs (default: 30).",
+    )
+    args = parser.parse_args()
+
+    if args.model == "all":
+        for name, trainer in TRAINERS.items():
+            print(f"\n{'=' * 60}")
+            print(f"  Training: {name.upper()}")
+            print(f"{'=' * 60}\n")
+            trainer(epochs=args.epochs)
+    else:
+        TRAINERS[args.model](epochs=args.epochs)
+
 
 if __name__ == "__main__":
-    train_cvae()
+    main()

@@ -1,0 +1,11 @@
+name: dates-generator
+channels:
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+    - torch>=2.5.1
+    - numpy>=2.4.5
+    - tqdm>=4.67.3
